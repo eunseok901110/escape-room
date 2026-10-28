@@ -203,6 +203,15 @@
   // 열린 노드를 작성 순서대로 합친다 (SPEC 4장 「세계 합치기」)
   function buildWorld() {
     const W = { spaces: {}, order: [], locks: {}, items: {}, explore: null, ending: null };
+    // 탐색 힌트는 가장 최근에 열린 노드 것 (열린 시점 = 필요한 자물쇠 중 가장 늦게 푼 순번)
+    const solvedRank = g => G.save.solved.indexOf(g);
+    let exploreAt = -2;
+    G.nodes.forEach((n, i) => {
+      if (n && n.explore) {
+        const at = Math.max(-1, ...G.data.nodes[i].req.map(solvedRank));
+        if (at >= exploreAt) { exploreAt = at; W.explore = { id: n.id || String(i), hints: n.explore }; }
+      }
+    });
     G.nodes.forEach((n, i) => {
       if (!n) return;
       for (const [sid, sp] of Object.entries(n.spaces || {})) {
@@ -215,7 +224,6 @@
       for (const [sid, svg] of Object.entries(n.layers || {})) if (W.spaces[sid]) W.spaces[sid].layers.push(svg);
       Object.assign(W.locks, n.locks || {});
       Object.assign(W.items, n.items || {});
-      if (n.explore) W.explore = { id: n.id || String(i), hints: n.explore };
       if (n.ending) W.ending = n.ending;
     });
     G.world = W;
@@ -405,6 +413,7 @@
   function moveTo(sid) {
     if (!G.world.spaces[sid] || sid === G.save.space) return;
     G.save.space = sid;
+    (G.save.visited || (G.save.visited = {}))[sid] = true;
     persist();
     Sfx.play('open');
     renderSpace('enter');
@@ -416,6 +425,7 @@
     if (!W.spaces[G.save.space]) G.save.space = W.order[0];
     const sid = G.save.space;
     const sp = W.spaces[sid];
+    (G.save.visited || (G.save.visited = {}))[sid] = true;
     if (G.onMotion) { window.removeEventListener('devicemotion', G.onMotion); G.onMotion = null; }
 
     const top = h('header', { class: 'topbar' },
@@ -471,7 +481,9 @@
     }
 
     // 이동 바
-    const nav = W.order.length > 1 ? h('nav', { class: 'spaces' }, W.order.map(s => h('button', {
+    // hidden 공간은 한 번 가 보기 전까지 이동 바에 안 나온다 (문으로 처음 들어가야 하는 곳)
+    const navList = W.order.filter(s => !W.spaces[s].hidden || G.save.visited[s] || s === sid);
+    const nav = navList.length > 1 ? h('nav', { class: 'spaces' }, navList.map(s => h('button', {
       class: 'space-b' + (s === sid ? ' now' : ''), 'data-space': s, onclick: () => moveTo(s),
     }, W.spaces[s].name || s))) : null;
 
@@ -508,9 +520,8 @@
   function onHot(sid, hid, scene) {
     const hs = G.world.spaces[sid].hotspots[hid];
     if (!hs) { Sfx.play('tap'); return; }
-    if (hs.go) { moveTo(hs.go); return; }
-    if (hs.lock) { openLock(hs.lock, hs); return; }
     const fk = `${sid}:${hid}`;
+    // 아이템 잠금은 문(go) · 자물쇠(lock)보다 먼저 본다
     if (hs.requires && !G.save.found[fk] && !hasItem(hs.requires)) {
       Sfx.play('tap');
       toast(hs.locked || '잠겨 있다. 무언가 필요해 보인다.');
@@ -519,6 +530,8 @@
     const first = !G.save.found[fk];
     G.save.found[fk] = true;
     if (first && hs.requires && hs.consume) { removeItem(hs.requires); drawInv(); }
+    if (hs.go) { persist(); moveTo(hs.go); return; }
+    if (hs.lock) { persist(); openLock(hs.lock, hs); return; }
     const got = first && hs.give ? giveItem(hs.give) : null;
     persist();
     syncScene(scene, sid);
