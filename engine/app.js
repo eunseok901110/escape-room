@@ -1,4 +1,4 @@
-/* 화면 · 상태 · 저장 · 기록 */
+/* 화면 · 상태 · 저장 · 기록 — v2: 공간을 오가며 자물쇠를 순서 자유로 푼다 (SPEC 4 · 8 · 9장) */
 (function () {
   const h = window.ESCh;
   const Sfx = window.ESCSfx;
@@ -32,6 +32,7 @@
     return 'C';
   }
   const wait = ms => new Promise(r => setTimeout(r, ms));
+  const testMode = /[?&]test\b/.test(location.search);
 
   /* ---------- 공통 UI ---------- */
   function toast(msg) {
@@ -51,7 +52,8 @@
       if (closed) return;
       closed = true;
       back.classList.remove('in'); panel.classList.remove('in');
-      setTimeout(() => { back.remove(); panel.remove(); opts.onClose && opts.onClose(); }, 260);
+      setTimeout(() => { back.remove(); panel.remove(); }, 260);
+      opts.onClose && opts.onClose();
     }
     back.onclick = close;
     root.append(back, panel);
@@ -59,6 +61,7 @@
     Sfx.play('open');
     return close;
   }
+  function closeAllSheets() { $('#sheet-root').replaceChildren(); }
 
   function ask(title, body, yes = '확인', no = '취소') {
     return new Promise(res => {
@@ -74,8 +77,7 @@
 
   function applyTheme(t) {
     const r = document.documentElement.style;
-    const keys = ['bg', 'panel', 'panel2', 'ink', 'sub', 'accent', 'line', 'glow'];
-    keys.forEach(k => (t && t[k] ? r.setProperty('--' + k, t[k]) : r.removeProperty('--' + k)));
+    ['bg', 'panel', 'panel2', 'ink', 'sub', 'accent', 'line', 'glow'].forEach(k => (t && t[k] ? r.setProperty('--' + k, t[k]) : r.removeProperty('--' + k)));
     document.body.dataset.font = (t && t.font) || 'sans';
     const meta = $('meta[name=theme-color]');
     if (meta) meta.content = (t && t.bg) || '#0d0c0b';
@@ -92,6 +94,7 @@
   /* ---------- 라우터 ---------- */
   function route() {
     stopGame();
+    closeAllSheets();
     window.scrollTo(0, 0);
     const hs = location.hash || '#/';
     if (hs.startsWith('#/play/')) playRoute(decodeURIComponent(hs.slice(7)));
@@ -120,7 +123,7 @@
       const sv = store.get(saveKey(d.id));
       const best = recs.filter(r => r.id === d.id).sort((a, b) => a.ms - b.ms)[0];
       let state;
-      if (sv && !sv.done && sv.build === d.build) state = h('div', { class: 'card-state go' }, `▶ 이어하기 · ${fmt(sv.elapsed)} · 방 ${sv.idx + 1}/${d.count}`);
+      if (sv && sv.v === 2 && !sv.done && sv.build === d.build) state = h('div', { class: 'card-state go' }, `▶ 이어하기 · ${fmt(sv.elapsed)} · 🔓 ${sv.solved.length}/${d.total}`);
       else if (best) state = h('div', { class: 'card-state done' }, `✓ 클리어 · 최고 ${fmt(best.ms)} · ${best.rank}`);
       else state = h('div', { class: 'card-state' }, '새로운 방');
       return h('button', {
@@ -162,7 +165,7 @@
         : h('p', { class: 'sub center' }, '아직 클리어한 방이 없어요.')));
   }
 
-  /* ---------- 게임 ---------- */
+  /* ---------- 게임 상태 ---------- */
   let G = null;
 
   function stopGame() {
@@ -171,22 +174,54 @@
     persist();
     Sfx.stopAmbient();
     document.removeEventListener('visibilitychange', G.onVis);
-    window.removeEventListener('devicemotion', G.onMotion);
+    if (G.onMotion) window.removeEventListener('devicemotion', G.onMotion);
     G = null;
   }
 
-  function persist() {
-    if (G && G.save) store.set(saveKey(G.data.id), G.save);
-  }
+  function persist() { if (G && G.save) store.set(saveKey(G.data.id), G.save); }
 
   function newSave(d) {
-    return { v: 1, build: d.build, idx: 0, keys: [d.k0], elapsed: 0, splits: [], hints: {}, wrong: {}, inv: [], found: {}, pstate: {}, done: false, started: Date.now() };
+    return { v: 2, build: d.build, keys: {}, solved: [], solvedAt: {}, names: {}, space: null, elapsed: 0, hints: {}, wrong: {}, seen: {}, inv: [], found: {}, pstate: {}, done: false, started: Date.now() };
   }
 
-  async function payloadAt(i) {
-    if (!G.cache[i]) G.cache[i] = await ESCCrypto.openPayload(G.save.keys[i], G.data.payloads[i]);
-    return G.cache[i];
+  // 풀린 자물쇠로 열 수 있는 노드를 모두 연다 → 새로 열린 노드 번호들
+  async function openNodes() {
+    const fresh = [];
+    const d = G.data;
+    for (let i = 0; i < d.nodes.length; i++) {
+      if (G.nodes[i]) continue;
+      const n = d.nodes[i];
+      if (!n.req.every(g => G.save.keys[g])) continue;
+      const key = n.req.length ? await ESCCrypto.nodeKey(n.req.map(g => G.save.keys[g])) : d.k0;
+      G.nodes[i] = await ESCCrypto.openPayload(key, n.box);
+      fresh.push(i);
+    }
+    buildWorld();
+    return fresh;
   }
+
+  // 열린 노드를 작성 순서대로 합친다 (SPEC 4장 「세계 합치기」)
+  function buildWorld() {
+    const W = { spaces: {}, order: [], locks: {}, items: {}, explore: null, ending: null };
+    G.nodes.forEach((n, i) => {
+      if (!n) return;
+      for (const [sid, sp] of Object.entries(n.spaces || {})) {
+        if (!W.spaces[sid]) { W.spaces[sid] = { id: sid, hotspots: {}, layers: [] }; W.order.push(sid); }
+        const { hotspots, ...rest } = sp;
+        Object.assign(W.spaces[sid], rest);
+        Object.assign(W.spaces[sid].hotspots, hotspots || {});
+      }
+      for (const [sid, map] of Object.entries(n.hotspots || {})) if (W.spaces[sid]) Object.assign(W.spaces[sid].hotspots, map);
+      for (const [sid, svg] of Object.entries(n.layers || {})) if (W.spaces[sid]) W.spaces[sid].layers.push(svg);
+      Object.assign(W.locks, n.locks || {});
+      Object.assign(W.items, n.items || {});
+      if (n.explore) W.explore = { id: n.id || String(i), hints: n.explore };
+      if (n.ending) W.ending = n.ending;
+    });
+    G.world = W;
+  }
+
+  const isSolved = lockId => { const l = G.world.locks[lockId]; return !!(l && G.save.keys[l.gate]); };
 
   async function playRoute(id) {
     const d = ESC.list.find(x => x.id === id);
@@ -197,13 +232,13 @@
       return;
     }
     let save = store.get(saveKey(id));
-    if (save && save.build !== d.build) {
+    if (save && (save.v !== 2 || save.build !== d.build)) {
       store.del(saveKey(id));
       save = null;
       toast('방이 새로 고쳐져서 처음부터 시작해요');
     }
-    G = { data: d, save, cache: {}, selected: new Set(), invListeners: [], running: false, last: performance.now(), lastSaved: 0 };
-    G.onVis = () => { if (document.hidden) persist(); G && (G.last = performance.now()); };
+    G = { data: d, save, nodes: [], world: null, running: false, last: performance.now(), lastSaved: 0 };
+    G.onVis = () => { if (document.hidden) persist(); if (G) G.last = performance.now(); };
     document.addEventListener('visibilitychange', G.onVis);
     G.timer = setInterval(tick, 250);
 
@@ -211,17 +246,22 @@
       const last = records().filter(r => r.id === id).sort((a, b) => b.date - a.date)[0];
       return renderResult(d, last || null);
     }
-    if (!save) return renderIntro();
+    const tmp = save || newSave(d);
+    G.save = tmp;
     try {
-      await payloadAt(save.idx);
+      await openNodes();
     } catch (e) {
       store.del(saveKey(id));
-      G.save = null;
+      G.save = newSave(d); G.nodes = [];
       toast('저장된 진행을 열 수 없어서 처음부터 시작해요');
-      return renderIntro();
+      await openNodes();
+      save = null;
     }
+    if (!G) return;
+    if (!save) { G.save = null; return renderIntro(); }
+    if (G.world.ending) return finish();
     startRunning();
-    renderPuzzle();
+    renderSpace();
   }
 
   function tick() {
@@ -240,17 +280,17 @@
     if (G.data.ambient) Sfx.startAmbient(G.data.ambient);
   }
 
-  async function renderIntro() {
+  function renderIntro() {
     const d = G.data;
-    G.save = null;
-    const tmp = newSave(d);
-    const p0 = await ESCCrypto.openPayload(d.k0, d.payloads[0]);
-    if (!G) return;
-    G.cache[0] = p0;
+    const start = G.nodes[0];
     showStory({
-      kicker: MOOD[d.mood] || '', title: d.title, html: (p0.intro && p0.intro.html) || '', cover: d.cover,
+      kicker: MOOD[d.mood] || '', title: d.title, html: (start.intro && start.intro.html) || '', cover: d.cover,
       button: '시작하기', back: true,
-      onNext: () => { G.save = tmp; persist(); startRunning(); Sfx.play('unlock'); renderPuzzle(); },
+      onNext: () => {
+        G.save = newSave(d);
+        G.save.space = start.start;
+        persist(); startRunning(); Sfx.play('unlock'); renderSpace();
+      },
     });
   }
 
@@ -261,17 +301,17 @@
       cover ? h('div', { class: 'story-cover', html: cover }) : null,
       h('div', { class: 'story-inner' },
         kicker ? h('div', { class: 'eyebrow' }, kicker) : null,
-        h('h1', { class: 'story-title' }, title),
+        title ? h('h1', { class: 'story-title' }, title) : null,
         h('div', { class: 'story-html', html }),
         btn)));
     window.scrollTo(0, 0);
   }
 
-  /* ---------- 퍼즐 화면 ---------- */
-  function hasItem(id) { return G.save.inv.some(it => it.id === id); }
+  /* ---------- 가방 ---------- */
+  const hasItem = id => G.save.inv.some(it => it.id === id);
 
-  function giveItem(def, p) {
-    const it = typeof def === 'string' ? { id: def, ...(p.items && p.items[def]) } : def;
+  function giveItem(def) {
+    const it = typeof def === 'string' ? { id: def, ...G.world.items[def] } : def;
     if (!it.id || hasItem(it.id)) return null;
     G.save.inv.push(it);
     persist();
@@ -279,27 +319,18 @@
     drawInv(it.id);
     return it;
   }
-
-  function removeItem(id) {
-    G.save.inv = G.save.inv.filter(it => it.id !== id);
-    G.selected.delete(id);
-  }
-
-  function invChanged() { G.invListeners.forEach(fn => fn()); }
+  function removeItem(id) { G.save.inv = G.save.inv.filter(it => it.id !== id); }
 
   function drawInv(popId) {
     const bar = $('.inv-items');
     if (!bar) return;
     const inv = G.save.inv;
     bar.replaceChildren(...(inv.length ? inv.map(it => h('button', {
-      class: 'inv-slot' + (G.selected.has(it.id) ? ' sel' : '') + (it.id === popId ? ' pop' : ''),
-      'aria-label': it.name, onclick: () => inspect(it),
+      class: 'inv-slot' + (it.id === popId ? ' pop' : ''), 'aria-label': it.name, onclick: () => inspect(it),
     }, h('span', { class: 'inv-ic', html: it.icon || '❔' }))) : [h('span', { class: 'inv-empty' }, '가방이 비어 있어요')]));
   }
 
   function inspect(it) {
-    const p = G.cache[G.save.idx].puzzle;
-    const isUse = p.device && p.device.type === 'use';
     const others = G.save.inv.filter(x => x.id !== it.id);
     let close;
     const combineList = h('div', { class: 'combine-list hidden' }, others.map(o => h('button', {
@@ -308,105 +339,120 @@
         close();
         if (!r) { Sfx.play('wrong'); toast('합쳐지지 않는다.'); return; }
         removeItem(it.id); removeItem(o.id);
-        G.save.inv.push(r); persist(); Sfx.play('item'); drawInv(r.id); invChanged();
+        G.save.inv.push(r); persist(); Sfx.play('item'); drawInv(r.id);
         setTimeout(() => inspect(r), 300);
         toast(`「${r.name}」 완성!`);
       },
     }, h('span', { class: 'inv-ic', html: o.icon || '' }), o.name)));
-    const sel = G.selected.has(it.id);
     close = sheet(h('div', { class: 'inspect' },
       h('div', { class: 'inspect-ic', html: it.icon || '' }),
       h('h3', null, it.name),
       it.desc ? h('p', { class: 'sub' }, it.desc) : null,
       it.html ? h('div', { class: 'inspect-html', html: it.html }) : null,
-      h('div', { class: 'dev-row wrap' },
-        isUse ? h('button', { class: 'btn primary', onclick: () => {
-          if (sel) G.selected.delete(it.id); else G.selected.add(it.id);
-          close(); drawInv(); invChanged();
-        } }, sel ? '고르기 취소' : '고르기') : null,
-        others.length ? h('button', { class: 'btn ghost', onclick: () => combineList.classList.toggle('hidden') }, '🔗 다른 것과 합치기') : null),
+      others.length ? h('div', { class: 'dev-row' }, h('button', { class: 'btn ghost', onclick: () => combineList.classList.toggle('hidden') }, '🔗 다른 것과 합치기')) : null,
       combineList), { cls: 'tall' });
   }
 
-  function openHints() {
-    const idx = G.save.idx;
-    const hints = G.cache[idx].puzzle.hints || [];
+  /* ---------- 힌트 ---------- */
+  function hintLevels(key, hints, title, redraw) {
+    const seen = G.save.hints[key] || 0;
+    return h('div', { class: 'hint-group' },
+      h('div', { class: 'hint-title' }, title),
+      ...hints.map((t, i) => {
+        if (i < seen) return h('div', { class: 'hint open' }, h('span', { class: 'hint-k' }, `${i + 1} · ${HINT_LABEL[i] || ''}`), h('p', { html: t }));
+        if (i === seen) return h('button', { class: 'hint next', onclick: () => {
+          G.save.hints[key] = i + 1; persist(); Sfx.play('hint'); redraw(); updateTop();
+        } }, `힌트 ${i + 1} 보기 · ${HINT_LABEL[i] || ''}`);
+        return null;
+      }));
+  }
+
+  function openHints(onlyLock) {
     const body = h('div', { class: 'hints' });
     const draw = () => {
-      const seen = G.save.hints[idx] || 0;
+      const W = G.world;
+      const open = Object.entries(W.locks).filter(([id]) => (G.save.seen[id] || id === onlyLock) && !isSolved(id));
+      const groups = [];
+      if (!onlyLock && W.explore) groups.push(hintLevels('x:' + W.explore.id, W.explore.hints, '🧭 어디를 봐야 할지 모르겠어요', draw));
+      open.filter(([id]) => !onlyLock || id === onlyLock).forEach(([id, l]) => groups.push(hintLevels(id, l.hints || [], `🔒 ${l.name}`, draw)));
       body.replaceChildren(
         h('h3', null, '💡 힌트'),
         h('p', { class: 'sub' }, '한 단계씩 열려요. 본 힌트 수는 클리어 기록에 남아요.'),
-        ...hints.map((t, i) => {
-          if (i < seen) return h('div', { class: 'hint open' }, h('span', { class: 'hint-k' }, `${i + 1} · ${HINT_LABEL[i] || ''}`), h('p', { html: t }));
-          if (i === seen) return h('button', { class: 'hint next', onclick: () => {
-            G.save.hints[idx] = i + 1; persist(); Sfx.play('hint'); draw(); updateHintBadge();
-          } }, `힌트 ${i + 1} 보기 · ${HINT_LABEL[i] || ''}`);
-          return h('div', { class: 'hint locked' }, `힌트 ${i + 1} · 앞 힌트를 먼저 봐요`);
-        }));
+        ...(groups.length ? groups : [h('p', { class: 'sub' }, '지금은 볼 힌트가 없어요. 장면 속 물건을 눌러 보세요.')]));
     };
     draw();
     sheet(body, { cls: 'tall' });
   }
 
-  function updateHintBadge() {
+  /* ---------- 공간 ---------- */
+  function updateTop() {
     const b = $('.hint-badge');
     if (b) { const n = sum(G.save.hints); b.textContent = n; b.hidden = !n; }
+    const p = $('.top-prog');
+    if (p) p.textContent = `🔓 ${G.save.solved.length}/${G.data.total}`;
   }
 
-  function syncFound(scene, idx) {
-    scene.querySelectorAll('[data-hide-when]').forEach(el => { el.style.display = G.save.found[`${idx}:${el.dataset.hideWhen}`] ? 'none' : ''; });
-    scene.querySelectorAll('[data-show-when]').forEach(el => { el.style.display = G.save.found[`${idx}:${el.dataset.showWhen}`] ? '' : 'none'; });
+  function syncScene(scene, sid) {
+    scene.querySelectorAll('[data-hide-when]').forEach(el => { el.style.display = G.save.found[`${sid}:${el.dataset.hideWhen}`] ? 'none' : ''; });
+    scene.querySelectorAll('[data-show-when]').forEach(el => { el.style.display = G.save.found[`${sid}:${el.dataset.showWhen}`] ? '' : 'none'; });
+    scene.querySelectorAll('[data-hide-solved]').forEach(el => { el.style.display = isSolved(el.dataset.hideSolved) ? 'none' : ''; });
+    scene.querySelectorAll('[data-hot]').forEach(el => {
+      const hs = G.world.spaces[sid].hotspots[el.dataset.hot];
+      el.classList.toggle('is-solved', !!(hs && hs.lock && isSolved(hs.lock)));
+    });
   }
 
-  async function renderPuzzle() {
+  function moveTo(sid) {
+    if (!G.world.spaces[sid] || sid === G.save.space) return;
+    G.save.space = sid;
+    persist();
+    Sfx.play('open');
+    renderSpace('enter');
+  }
+
+  function renderSpace(anim) {
     const d = G.data;
-    const idx = G.save.idx;
-    let pl;
-    try { pl = await payloadAt(idx); } catch (e) { toast('방을 열지 못했어요'); return go('#/'); }
-    if (!G) return;
-    if (idx >= d.count) return finish();
-    const p = pl.puzzle;
-    G.selected.clear();
-    G.invListeners = [];
-    G.pstate = G.save.pstate[idx] || (G.save.pstate[idx] = {});
-    if (p.startItems) p.startItems.forEach(id => { if (!hasItem(id)) G.save.inv.push({ id, ...p.items[id] }); });
+    const W = G.world;
+    if (!W.spaces[G.save.space]) G.save.space = W.order[0];
+    const sid = G.save.space;
+    const sp = W.spaces[sid];
+    if (G.onMotion) { window.removeEventListener('devicemotion', G.onMotion); G.onMotion = null; }
 
-    // 위 바
-    const dots = h('div', { class: 'prog' }, Array.from({ length: d.count }, (_, i) => h('span', { class: 'prog-d' + (i < idx ? ' done' : i === idx ? ' now' : '') })));
     const top = h('header', { class: 'topbar' },
       h('button', { class: 'icon-btn', 'aria-label': '나가기', onclick: () => { persist(); go('#/'); } }, '←'),
-      h('div', { class: 'top-mid' }, h('span', { class: 'top-title' }, d.title), dots),
+      h('div', { class: 'top-mid' }, h('span', { class: 'top-title' }, d.title), h('span', { class: 'top-prog' }, '')),
       h('span', { class: 'clock' }, fmt(G.save.elapsed)),
-      h('button', { class: 'icon-btn hint-btn', 'aria-label': '힌트', onclick: openHints }, '💡', h('span', { class: 'hint-badge', hidden: true }, '')),
+      h('button', { class: 'icon-btn hint-btn', 'aria-label': '힌트', onclick: () => openHints() }, '💡', h('span', { class: 'hint-badge', hidden: true }, '')),
       soundBtn());
 
-    // 장면
-    const scene = h('div', { class: 'scene', html: p.scene || '' });
-    syncFound(scene, idx);
+    // 장면 = 공간 scene + 노드 layers
+    const svg = (sp.scene || '').replace(/<\/svg>\s*$/, (sp.layers || []).join('') + '</svg>');
+    const scene = h('div', { class: 'scene' + (anim ? ' enter' : ''), html: svg });
+    syncScene(scene, sid);
     scene.addEventListener('click', e => {
       const hot = e.target.closest('[data-hot]');
       if (!hot || !scene.contains(hot)) return;
       ripple(scene, e);
-      onHot(hot.dataset.hot, p, scene);
+      onHot(sid, hot.dataset.hot, scene);
     });
+
     const extras = [];
-    if (p.effect === 'flashlight') {
+    const pst = G.save.pstate['s:' + sid] || (G.save.pstate['s:' + sid] = {});
+    if (sp.effect === 'flashlight') {
       const fl = h('div', { class: 'flash' });
       scene.append(fl);
-      scene.classList.add('dark');
       const move = e => { const r = scene.getBoundingClientRect(); fl.style.setProperty('--x', (e.clientX - r.left) + 'px'); fl.style.setProperty('--y', (e.clientY - r.top) + 'px'); };
       scene.addEventListener('pointermove', move);
       scene.addEventListener('pointerdown', move);
       extras.push(h('p', { class: 'effect-tip' }, '🔦 손가락으로 어둠을 비춰 보세요'));
     }
-    if (p.effect === 'shake') {
+    if (sp.effect === 'shake') {
       const reveal = () => {
         if (scene.classList.contains('shaken')) return;
-        scene.classList.add('shaken', 'shaking'); G.pstate.shaken = true; persist(); Sfx.play('reveal');
+        scene.classList.add('shaken', 'shaking'); pst.shaken = true; persist(); Sfx.play('reveal');
         setTimeout(() => scene.classList.remove('shaking'), 700);
       };
-      if (G.pstate.shaken) scene.classList.add('shaken');
+      if (pst.shaken) scene.classList.add('shaken');
       let lastShake = 0;
       G.onMotion = e => {
         const a = e.accelerationIncludingGravity || e.acceleration;
@@ -424,61 +470,32 @@
       } }, '📳 흔들기'));
     }
 
-    // 장치
-    const dev = h('section', { class: 'device' });
-    const ctx = {
-      busy: false,
-      toast,
-      inv: { selected: () => G.save.inv.filter(it => G.selected.has(it.id)), onChange: fn => G.invListeners.push(fn) },
-      submit: async str => {
-        if (ctx.busy) return false;
-        ctx.busy = true;
-        dev.classList.add('busy');
-        const t0 = Date.now();
-        let key = null;
-        try { key = await ESCCrypto.tryGate(str, d.gates[idx]); } catch (e) { key = null; }
-        const left = 450 - (Date.now() - t0);
-        if (left > 0) await wait(left);
-        if (!G) return false;
-        dev.classList.remove('busy');
-        ctx.busy = false;
-        if (key) { onSolved(key, p); return true; }
-        G.save.wrong[idx] = (G.save.wrong[idx] || 0) + 1;
-        persist();
-        Sfx.play('wrong');
-        dev.classList.remove('wrong'); void dev.offsetWidth; dev.classList.add('wrong');
-        toast(WRONG_LINES[Math.floor(Math.random() * WRONG_LINES.length)]);
-        return false;
-      },
-    };
-    if (/[?&]test\b/.test(location.search)) window.__esc = { submit: ctx.submit, idx }; // tools/playtest.mjs 용
-    const type = (p.device && p.device.type) || 'text';
-    window.ESCDevices[type](dev, (p.device && p.device.config) || {}, ctx);
+    // 이동 바
+    const nav = W.order.length > 1 ? h('nav', { class: 'spaces' }, W.order.map(s => h('button', {
+      class: 'space-b' + (s === sid ? ' now' : ''), 'data-space': s, onclick: () => moveTo(s),
+    }, W.spaces[s].name || s))) : null;
 
     const inv = h('footer', { class: 'inv' }, h('span', { class: 'inv-k', 'aria-hidden': 'true' }, '🎒', h('small', null, '가방')), h('div', { class: 'inv-items' }));
 
     app().replaceChildren(h('div', { class: 'play' }, top,
       h('main', { class: 'play-main' },
-        h('div', { class: 'room-head' }, h('span', { class: 'eyebrow' }, `ROOM ${idx + 1} / ${d.count}`), h('h2', { class: 'room-title' }, p.title)),
+        h('div', { class: 'room-head' }, h('span', { class: 'eyebrow' }, `📍 ${W.order.indexOf(sid) + 1} / ${W.order.length}`), h('h2', { class: 'room-title' }, sp.name || sid)),
         scene, ...extras,
-        p.prompt ? h('p', { class: 'prompt', html: p.prompt }) : null,
-        dev),
+        sp.desc ? h('p', { class: 'prompt', html: sp.desc }) : null,
+        nav),
       inv));
     drawInv();
-    updateHintBadge();
-    window.scrollTo(0, 0);
+    updateTop();
+    if (anim !== 'keep') window.scrollTo(0, 0);
 
-    if (p.script) {
-      try {
-        const fn = new Function('return (' + p.script + ')')();
-        fn({
-          root: dev, scene, submit: ctx.submit, toast, sfx: n => Sfx.play(n), tone: (f, du) => Sfx.tone(f, du),
-          give: def => giveItem(def, p), has: hasItem, state: G.pstate, save: persist,
-          reveal: sel => scene.querySelectorAll(sel).forEach(el => el.classList.add('revealed')),
-          h, s: window.ESCs,
-        });
-      } catch (e) { console.error('script', e); }
-    }
+    if (sp.script) runScript(sp.script, {
+      scene, toast, sfx: n => Sfx.play(n), tone: (f, du) => Sfx.tone(f, du), give: giveItem, has: hasItem,
+      solved: isSolved, state: pst, save: persist, h, s: window.ESCs,
+    });
+  }
+
+  function runScript(src, api) {
+    try { new Function('return (' + src + ')')()(api); } catch (e) { console.error('script', e); }
   }
 
   function ripple(scene, e) {
@@ -488,11 +505,12 @@
     setTimeout(() => dot.remove(), 600);
   }
 
-  function onHot(id, p, scene) {
-    const hs = p.hotspots && p.hotspots[id];
+  function onHot(sid, hid, scene) {
+    const hs = G.world.spaces[sid].hotspots[hid];
     if (!hs) { Sfx.play('tap'); return; }
-    const idx = G.save.idx;
-    const fk = `${idx}:${id}`;
+    if (hs.go) { moveTo(hs.go); return; }
+    if (hs.lock) { openLock(hs.lock, hs); return; }
+    const fk = `${sid}:${hid}`;
     if (hs.requires && !G.save.found[fk] && !hasItem(hs.requires)) {
       Sfx.play('tap');
       toast(hs.locked || '잠겨 있다. 무언가 필요해 보인다.');
@@ -500,10 +518,10 @@
     }
     const first = !G.save.found[fk];
     G.save.found[fk] = true;
-    if (first && hs.requires && hs.consume) { removeItem(hs.requires); drawInv(); invChanged(); }
-    const got = first && hs.give ? giveItem(hs.give, p) : null;
+    if (first && hs.requires && hs.consume) { removeItem(hs.requires); drawInv(); }
+    const got = first && hs.give ? giveItem(hs.give) : null;
     persist();
-    syncFound(scene, idx);
+    syncScene(scene, sid);
     if (hs.html || hs.title) {
       sheet(h('div', { class: 'inspect' },
         hs.title ? h('h3', null, hs.title) : null,
@@ -513,46 +531,108 @@
     else Sfx.play('tap');
   }
 
-  async function onSolved(key, p) {
-    const idx = G.save.idx;
-    G.save.keys[idx + 1] = key;
-    G.save.splits[idx] = Math.round(G.save.elapsed);
-    (p.consume || []).forEach(removeItem);
-    G.save.idx = idx + 1;
+  /* ---------- 자물쇠 ---------- */
+  function openLock(lockId, hs) {
+    const l = G.world.locks[lockId];
+    if (!l) return;
+    if (isSolved(lockId)) {
+      sheet(h('div', { class: 'inspect' }, h('h3', null, l.name), h('div', { class: 'inspect-html', html: l.after || '<p>이미 열었다.</p>' })));
+      return;
+    }
+    if (!G.save.seen[lockId]) { G.save.seen[lockId] = true; persist(); }
+    const dev = h('section', { class: 'device in-sheet' });
+    let close;
+    const ctx = {
+      busy: false,
+      toast,
+      inv: { all: () => G.save.inv.slice() },
+      submit: async str => {
+        if (ctx.busy) return false;
+        ctx.busy = true;
+        dev.classList.add('busy');
+        const t0 = Date.now();
+        let key = null;
+        try { key = await ESCCrypto.tryGate(str, G.data.gates[l.gate]); } catch (e) { key = null; }
+        const left = 450 - (Date.now() - t0);
+        if (left > 0) await wait(left);
+        if (!G) return false;
+        dev.classList.remove('busy');
+        ctx.busy = false;
+        if (key) { dev.classList.add('solved'); await wait(650); close(); onSolved(lockId, l, key); return true; }
+        G.save.wrong[lockId] = (G.save.wrong[lockId] || 0) + 1;
+        persist();
+        Sfx.play('wrong');
+        dev.classList.remove('wrong'); void dev.offsetWidth; dev.classList.add('wrong');
+        toast(WRONG_LINES[Math.floor(Math.random() * WRONG_LINES.length)]);
+        return false;
+      },
+    };
+    if (testMode) window.__esc = { submit: ctx.submit, lock: lockId };
+    const type = (l.device && l.device.type) || 'text';
+    window.ESCDevices[type](dev, (l.device && l.device.config) || {}, ctx);
+    close = sheet(h('div', { class: 'lock' },
+      h('div', { class: 'lock-head' }, h('span', { class: 'eyebrow' }, '🔒 LOCK'),
+        h('button', { class: 'btn ghost sm', onclick: () => openHints(lockId) }, '💡 힌트')),
+      h('h3', null, l.name),
+      l.prompt ? h('p', { class: 'prompt', html: l.prompt }) : null,
+      dev), { cls: 'lock-sheet', onClose: () => { if (testMode && window.__esc && window.__esc.lock === lockId) window.__esc = null; } });
+    if (l.script) {
+      const pst = G.save.pstate['l:' + lockId] || (G.save.pstate['l:' + lockId] = {});
+      runScript(l.script, { root: dev, submit: ctx.submit, toast, sfx: n => Sfx.play(n), tone: (f, du) => Sfx.tone(f, du), give: giveItem, has: hasItem, state: pst, save: persist, h, s: window.ESCs });
+    }
+  }
+
+  async function onSolved(lockId, l, key) {
+    const s = G.save;
+    s.keys[l.gate] = key;
+    s.solved.push(l.gate);
+    s.solvedAt[l.gate] = Math.round(s.elapsed);
+    s.names[l.gate] = l.name;
+    (l.consume || []).forEach(removeItem);
     persist();
     Sfx.play('unlock');
-    const dev = $('.device');
-    if (dev) dev.classList.add('solved');
-    await wait(800);
+    let fresh = [];
+    try { fresh = await openNodes(); } catch (e) { console.error(e); }
     if (!G) return;
-    const last = G.save.idx >= G.data.count;
-    showStory({
-      kicker: 'UNLOCKED', title: p.title, html: (p.solved && p.solved.html) || '<p>철컥. 무언가 열렸다.</p>',
-      button: last ? '마지막 문을 연다' : '다음 방으로', cls: 'solved-story',
-      onNext: () => (last ? finish() : renderPuzzle()),
-    });
+    const nodes = fresh.map(i => G.nodes[i]);
+    if (G.world.ending) return finish();
+    const goTo = nodes.map(n => n.go).filter(Boolean).pop();
+    if (goTo) s.space = goTo;
+    persist();
+    const story = nodes.find(n => n.story);
+    if (story) {
+      showStory({
+        kicker: 'UNLOCKED', title: story.story.title || l.name, html: story.story.html || '', button: '계속', cls: 'solved-story',
+        onNext: () => renderSpace('enter'),
+      });
+    } else {
+      renderSpace(goTo ? 'enter' : 'keep');
+      toast(nodes.map(n => n.toast).filter(Boolean)[0] || `🔓 ${l.name} — 열렸다!`);
+    }
   }
 
   async function finish() {
     const d = G.data;
     G.running = false;
-    let end = { ending: { html: '<p>탈출 성공!</p>' } };
-    try { end = await payloadAt(d.count); } catch (e) { /* 기본 엔딩 */ }
-    if (!G) return;
+    const end = G.world.ending || { title: '탈출 성공', html: '' };
     const s = G.save;
+    const first = !s.done;
     s.done = true;
-    const rec = {
-      id: d.id, title: d.title, ms: Math.round(s.elapsed), hints: sum(s.hints), wrong: sum(s.wrong),
-      splits: s.splits, date: Date.now(), name: prefs.name || '',
-    };
-    rec.rank = rankOf(rec.ms, rec.hints);
-    const all = records(); all.push(rec); store.set('esc:records', all);
+    let rec = null;
+    if (first) {
+      rec = {
+        id: d.id, title: d.title, ms: Math.round(s.elapsed), hints: sum(s.hints), wrong: sum(s.wrong), date: Date.now(), name: prefs.name || '',
+        splits: s.solved.map(g => ({ name: s.names[g] || '', at: s.solvedAt[g] || 0 })),
+      };
+      rec.rank = rankOf(rec.ms, rec.hints);
+      const all = records(); all.push(rec); store.set('esc:records', all);
+    }
     persist();
     Sfx.stopAmbient();
     Sfx.play('clear');
     showStory({
-      kicker: 'ESCAPED', title: (end.ending && end.ending.title) || '탈출 성공', html: (end.ending && end.ending.html) || '',
-      button: '기록 보기', cls: 'ending-story', onNext: () => renderResult(d, rec),
+      kicker: 'ESCAPED', title: end.title || '탈출 성공', html: end.html || '',
+      button: '기록 보기', cls: 'ending-story', onNext: () => renderResult(d, rec || records().filter(r => r.id === d.id).pop()),
     });
   }
 
@@ -563,7 +643,7 @@
       `⏱ ${fmt(r.ms)} · 등급 ${r.rank}`,
       `💡 힌트 ${r.hints} · ❌ 오답 ${r.wrong}`,
       r.name ? `— ${r.name}` : null,
-      location.href.split('#')[0],
+      location.href.split('#')[0].replace(/\?.*$/, ''),
     ].filter(Boolean).join('\n');
 
     const name = h('input', { class: 'dev-text', placeholder: '이름 (공유할 때 표시)', value: prefs.name, maxlength: 16 });
@@ -574,9 +654,7 @@
     const share = async () => {
       name.dispatchEvent(new Event('change'));
       const text = shareText({ ...rec, name: prefs.name });
-      try {
-        if (navigator.share) { await navigator.share({ text }); return; }
-      } catch (e) { if (e && e.name === 'AbortError') return; }
+      try { if (navigator.share) { await navigator.share({ text }); return; } } catch (e) { if (e && e.name === 'AbortError') return; }
       try { await navigator.clipboard.writeText(text); toast('기록을 복사했어요'); } catch (e) { sheet(h('pre', { class: 'share-pre' }, text)); }
     };
     const replay = async () => {
@@ -586,6 +664,7 @@
       route();
     };
     const best = records().filter(r => r.id === d.id).sort((a, b) => a.ms - b.ms)[0];
+    const splits = (rec && rec.splits) || [];
 
     app().replaceChildren(h('div', { class: 'result' },
       h('div', { class: 'page-bar' }, h('button', { class: 'icon-btn', onclick: () => go('#/') }, '←')),
@@ -598,8 +677,10 @@
           h('div', null, h('b', null, rec.hints), h('span', null, '힌트')),
           h('div', null, h('b', null, rec.wrong), h('span', null, '오답')),
           h('div', null, h('b', null, best ? fmt(best.ms) : '-'), h('span', null, '최고 기록'))),
-        rec.splits && rec.splits.length ? h('div', { class: 'splits' }, rec.splits.map((t, i) =>
-          h('div', { class: 'split' }, h('span', null, `ROOM ${i + 1}`), h('span', { class: 'split-bar', style: { '--w': Math.max(4, ((t - (rec.splits[i - 1] || 0)) / rec.ms) * 100) + '%' } }), h('b', null, fmt(t - (rec.splits[i - 1] || 0)))))) : null,
+        splits.length ? h('div', { class: 'splits' }, splits.map((sp, i) => {
+          const dt = sp.at - (splits[i - 1] ? splits[i - 1].at : 0);
+          return h('div', { class: 'split' }, h('span', { class: 'split-name' }, sp.name || `🔒 ${i + 1}`), h('span', { class: 'split-bar', style: { '--w': Math.max(4, (dt / Math.max(rec.ms, 1)) * 100) + '%' } }), h('b', null, fmt(dt)));
+        })) : null,
         h('div', { class: 'result-share' }, name, h('button', { class: 'btn primary', onclick: share }, '📤 기록 공유')),
       ] : h('p', { class: 'sub' }, '클리어한 방이에요.'),
       h('div', { class: 'dev-row' },

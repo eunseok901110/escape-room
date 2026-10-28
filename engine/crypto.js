@@ -52,5 +52,14 @@
     return JSON.parse(dec.decode(await decrypt(k, box)));
   }
 
-  window.ESCCrypto = { normalize, tryGate, openPayload };
+  // 노드 열쇠 = SHA-256("esc-node" ‖ 자물쇠 열쇠들 (gate 번호 순)) — tools/build.mjs nodeKey 와 같아야 한다
+  async function nodeKey(rawB64List) {
+    const parts = [enc.encode('esc-node'), ...rawB64List.map(b64.from)];
+    const all = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let o = 0;
+    for (const p of parts) { all.set(p, o); o += p.length; }
+    return b64.to(new Uint8Array(await crypto.subtle.digest('SHA-256', all)));
+  }
+
+  window.ESCCrypto = { normalize, tryGate, openPayload, nodeKey };
 })();

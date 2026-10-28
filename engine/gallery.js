@@ -15,12 +15,13 @@
     ['order', '조각 순서 (격자)', { columns: 3, pieces: ['🐭', '🐮', '🐯', '🐰', '🐲', '🐍'].map((e, i) => ({ id: String(i), html: `<span style="font-size:30px">${e}</span>` })) }],
     ['piano', '피아노', {}],
     ['sliders', '슬라이더', { count: 4, max: 9, labels: ['북', '동', '남', '서'] }],
+    ['use', '아이템 쓰기', { pick: 2 }],
   ];
 
   function render(root) {
     const fake = {
       toast: window.ESC.toast,
-      inv: { selected: () => [], onChange: () => { } },
+      inv: { all: () => [{ id: 'key', name: '작은 열쇠', icon: '🗝️' }, { id: 'map', name: '지도 조각', icon: '🗺️' }] },
       submit: async s => { window.ESC.toast(`입력값: ${s}`); return false; },
     };
     const flashScene = h('div', { class: 'scene dark', html: `<svg viewBox="0 0 400 240"><rect width="400" height="240" fill="#2a2418"/><text x="300" y="190" fill="#e3a64c" font-size="28" font-family="serif">여기 숨은 글자</text><text x="60" y="70" fill="#c9bfa8" font-size="18">벽의 낙서</text></svg>` });

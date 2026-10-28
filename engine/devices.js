@@ -1,6 +1,6 @@
 /* 장치 13종 — 모두 입력을 문자열 하나로 만들어 ctx.submit 에 넘긴다
  * ESCDevices[type](el, config, ctx)
- * ctx = { submit(str): Promise<bool>, toast(msg), inv: { selected(), onChange(fn) } }
+ * ctx = { submit(str): Promise<bool>, toast(msg), inv: { all() } }
  */
 (function () {
   const S = () => window.ESCSfx;
@@ -319,21 +319,26 @@
     el.append(row, goBtn(ctx, () => vals.join('')));
   };
 
-  /* use: { label } — 인벤토리에서 고른 아이템을 쓴다 */
+  /* use: { label, pick: 1 } — 자물쇠 시트 안에 가방 아이템을 늘어놓고 골라 쓴다 */
   D.use = (el, c, ctx) => {
-    const chosen = h('div', { class: 'use-chosen' });
+    const sel = new Set();
+    const list = h('div', { class: 'use-list' });
     const draw = () => {
-      const sel = ctx.inv.selected();
-      chosen.replaceChildren(...(sel.length
-        ? sel.map(it => h('span', { class: 'use-chip' }, h('span', { class: 'use-ic', html: it.icon || '' }), it.name))
-        : [h('span', { class: 'seq-empty' }, '아래 가방에서 아이템을 눌러 「고르기」')]));
+      const all = ctx.inv.all();
+      list.replaceChildren(...(all.length ? all.map(it => h('button', {
+        class: 'use-item' + (sel.has(it.id) ? ' sel' : ''),
+        onclick: () => {
+          S().play('tick');
+          if (sel.has(it.id)) sel.delete(it.id);
+          else { if ((c.pick || 1) === 1) sel.clear(); sel.add(it.id); }
+          draw();
+        },
+      }, h('span', { class: 'use-ic', html: it.icon || '' }), h('span', { class: 'use-name' }, it.name))) : [h('span', { class: 'seq-empty' }, '가방이 비어 있어요')]));
     };
-    ctx.inv.onChange(draw);
     draw();
-    el.append(chosen, h('button', { class: 'btn primary dev-go', onclick: async () => {
-      const sel = ctx.inv.selected();
-      if (!sel.length) return ctx.toast('쓸 아이템을 먼저 골라 주세요');
-      await ctx.submit(sel.map(it => it.id).sort().join('+'));
+    el.append(list, h('button', { class: 'btn primary dev-go', onclick: async () => {
+      if (!sel.size) return ctx.toast('쓸 아이템을 먼저 골라 주세요');
+      await ctx.submit([...sel].sort().join('+'));
     } }, c.label || '사용하기'));
   };
 

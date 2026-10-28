@@ -400,3 +400,30 @@ input { font: inherit; color: inherit; }
 @keyframes grow { from { width: 0; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
 @media (min-width: 600px) { .home-title { font-size: 64px; } }
+
+/* ---------- v2: 공간 · 자물쇠 ---------- */
+.top-prog { font: 600 12px var(--f-mono); color: var(--accent); letter-spacing: .04em; }
+.scene.enter { animation: spaceIn .45s cubic-bezier(.2,.8,.3,1) both; }
+.scene [data-hot].is-solved { filter: saturate(.7); }
+.spaces { display: flex; gap: 8px; overflow-x: auto; scrollbar-width: none; padding: 2px; margin: 2px -2px 0; }
+.space-b {
+  flex: none; min-height: 44px; padding: 0 16px; border-radius: 14px; background: var(--panel); border: 1px solid var(--line);
+  font-size: 14px; font-weight: 600; color: var(--sub); display: inline-flex; align-items: center; gap: 6px;
+}
+.space-b::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: .5; }
+.space-b.now { color: var(--ink); border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
+.space-b.now::before { background: var(--accent); opacity: 1; box-shadow: 0 0 8px var(--glow); }
+.lock-sheet { padding-top: 10px; }
+.lock-head { display: flex; align-items: center; justify-content: space-between; padding-right: 44px; }
+.lock h3 { margin: 10px 0 2px; font-size: 21px; }
+.lock .prompt { margin: 0 0 14px; }
+.device.in-sheet { animation: none; }
+.use-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; }
+.use-item { display: grid; justify-items: center; gap: 6px; padding: 12px 6px; border-radius: 14px; background: var(--bg); border: 1px solid var(--line); font-size: 12.5px; line-height: 1.3; }
+.use-item .use-ic { width: 40px; height: 40px; font-size: 28px; }
+.use-item.sel { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); background: color-mix(in srgb, var(--accent) 10%, var(--bg)); }
+.hint-group { display: grid; gap: 8px; padding: 14px 0 4px; border-top: 1px solid var(--line); }
+.hint-title { font-weight: 700; font-size: 15px; }
+.split { grid-template-columns: minmax(70px, 34%) 1fr 44px; }
+.split-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-family: var(--f-ui); }
+@keyframes spaceIn { from { opacity: 0; transform: translateX(18px) scale(.985); } }
